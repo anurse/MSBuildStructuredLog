@@ -19,7 +19,7 @@ namespace LogProcessor
         [Argument(0, "<FILE>", "The file to load.")]
         public string File { get; set; }
 
-        public int OnExecute(IConsole console)
+        public async Task<int> OnExecuteAsync(IConsole console)
         {
             if(string.IsNullOrEmpty(OutputFile))
             {
@@ -49,7 +49,7 @@ namespace LogProcessor
             console.WriteLine("Replaying binary log...");
 
             var sw = Stopwatch.StartNew();
-            eventSource.Replay(File);
+            await eventSource.ReplayAsync(File);
             var elapsed = sw.Elapsed;
 
             dbLogger.Shutdown();

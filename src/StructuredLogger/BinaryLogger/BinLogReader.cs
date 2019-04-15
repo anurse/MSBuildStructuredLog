@@ -1,10 +1,12 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
+using System.Threading.Channels;
 using Microsoft.Build.Framework;
+using SystemTask = System.Threading.Tasks.Task;
 
 namespace Microsoft.Build.Logging.StructuredLogger
 {
@@ -35,6 +37,14 @@ namespace Microsoft.Build.Logging.StructuredLogger
             using (var stream = new FileStream(sourceFilePath, FileMode.Open, FileAccess.Read, FileShare.Read))
             {
                 Replay(stream);
+            }
+        }
+
+        public async SystemTask ReplayAsync(string sourceFilePath)
+        {
+            using (var stream = new FileStream(sourceFilePath, FileMode.Open, FileAccess.Read, FileShare.Read))
+            {
+                await ReplayAsync(stream);
             }
         }
 
@@ -93,6 +103,72 @@ namespace Microsoft.Build.Logging.StructuredLogger
             }
 
             processingTask.Wait();
+        }
+
+        public async SystemTask ReplayAsync(Stream stream)
+        {
+            var gzipStream = new GZipStream(stream, CompressionMode.Decompress, leaveOpen: true);
+            var binaryReader = new BinaryReader(gzipStream);
+
+            int fileFormatVersion = binaryReader.ReadInt32();
+
+            // the log file is written using a newer version of file format
+            // that we don't know how to read
+            if (fileFormatVersion > BinaryLogger.FileFormatVersion)
+            {
+                var text = $"Unsupported log file format. Latest supported version is {BinaryLogger.FileFormatVersion}, the log file has version {fileFormatVersion}.";
+                throw new NotSupportedException(text);
+            }
+
+            // Use a producer-consumer queue so that IO can happen on one thread
+            // while processing can happen on another thread decoupled. The speed
+            // up is from 4.65 to 4.15 seconds.
+            var channel = Channel.CreateBounded<BuildEventArgs>(5000);
+            var processingTask = System.Threading.Tasks.Task.Run(async () =>
+            {
+                while (await channel.Reader.WaitToReadAsync())
+                {
+                    while (channel.Reader.TryRead(out var args))
+                    {
+                        Dispatch(args);
+                    }
+                }
+            });
+
+            int recordsRead = 0;
+
+            var reader = new BuildEventArgsReader(binaryReader, fileFormatVersion);
+            reader.OnBlobRead += OnBlobRead;
+            while (true)
+            {
+                BuildEventArgs instance = null;
+
+                try
+                {
+                    instance = reader.Read();
+                }
+                catch (Exception ex)
+                {
+                    OnException?.Invoke(ex);
+                }
+
+                recordsRead++;
+                if (instance == null)
+                {
+                    channel.Writer.TryComplete();
+                    break;
+                }
+
+                while (!channel.Writer.TryWrite(instance))
+                {
+                    if (!await channel.Writer.WaitToWriteAsync())
+                    {
+                        throw new ObjectDisposedException("Channel complete?");
+                    }
+                }
+            }
+
+            await processingTask;
         }
 
         private class DisposableEnumerable<T> : IEnumerable<T>, IDisposable
