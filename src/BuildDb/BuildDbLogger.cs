@@ -1,13 +1,17 @@
 using Microsoft.Build.Framework;
 using Microsoft.Build.Logging.BuildDb.Model;
 using Microsoft.Build.Utilities;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Console;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 
 namespace Microsoft.Build.Logging.BuildDb
 {
@@ -15,21 +19,30 @@ namespace Microsoft.Build.Logging.BuildDb
     {
         private BuildDbContext _db;
         private Model.Build _build;
+        private Stopwatch _stopwatch;
+        private SqliteConnection _connection;
 
         public override void Initialize(IEventSource eventSource)
         {
+            _stopwatch = Stopwatch.StartNew();
             Environment.SetEnvironmentVariable("MSBUILDTARGETOUTPUTLOGGING", "true");
             Environment.SetEnvironmentVariable("MSBUILDLOGIMPORTS", "1");
 
-            var logFile = ProcessParameters();
+            // Create the database in memory, we'll save it to disk at the end.
+            // This is faster because we don't need persistence until the whole thing is built.
+            // This way, individual transactions occur in memory and the whole thing is dumped to disk later.
 
-            // Create the database
+            // We need to open a SQLite connection directly and give it to EF.
+            // If we use a connection string, it'll keep closing and re-opening it, but
+            // since this is an in-memory DB, it'll be recreated for every call to SaveChanges()!
+            _connection = new SqliteConnection("Data Source=:memory:");
+            _connection.Open();
+
             var options = new DbContextOptionsBuilder()
-                .UseSqlite($"Data Source={Path.GetFullPath(logFile)}")
+                .UseSqlite(_connection)
                 .Options;
 
             _db = new BuildDbContext(options);
-            _db.Database.EnsureDeleted();
             _db.Database.EnsureCreated();
 
             // Attach Event Handlers
@@ -39,11 +52,34 @@ namespace Microsoft.Build.Logging.BuildDb
             eventSource.ProjectFinished += ProjectFinished;
         }
 
+        public override void Shutdown()
+        {
+            Debug.Assert(_connection != null, "Shutdown called without calling Initialize!");
+
+            Console.WriteLine($"Finished generating build log in {_stopwatch.Elapsed.TotalSeconds:0.00} seconds.");
+            var logFile = ProcessParameters();
+
+            // Now we "backup" the in-memory database to disk
+            // Open a connection to a new on-disk DB
+            using (var targetConnection = new SqliteConnection($"Data Source={logFile}"))
+            {
+                // Backup the data.
+                var sw = new Stopwatch();
+                Console.WriteLine("Saving database...");
+                _connection.BackupDatabase(targetConnection);
+                Console.WriteLine($"Saved in {sw.Elapsed.TotalSeconds:0.00} seconds.");
+            }
+
+            _connection.Dispose();
+
+            base.Shutdown();
+        }
+
         private void ProjectFinished(object sender, ProjectFinishedEventArgs args)
         {
             Debug.Assert(_build != null && _build.Id > 0, "Build must have started!");
             var project = _db.Projects.FirstOrDefault(p => p.BuildId == _build.Id && p.ProjectContextId == args.BuildEventContext.ProjectContextId);
-            if(project == null)
+            if (project == null)
             {
                 throw new InvalidOperationException("A project that was not started finished!");
             }
@@ -57,7 +93,7 @@ namespace Microsoft.Build.Logging.BuildDb
             Debug.Assert(_build != null && _build.Id > 0, "Build must have started!");
             var project = GetOrAddProject(args);
 
-            if(args.ParentProjectBuildEventContext.ProjectContextId > 0)
+            if (args.ParentProjectBuildEventContext.ProjectContextId > 0)
             {
                 var parent = GetOrAddProject(args.ParentProjectBuildEventContext.ProjectContextId);
                 project.Parent = parent;
@@ -175,26 +211,27 @@ namespace Microsoft.Build.Logging.BuildDb
 
                 if (args.Items != null)
                 {
-                    var items = args.Items
-                        .Cast<DictionaryEntry>()
-                        .Select(d => new KeyValuePair<string, ITaskItem>(
-                            Convert.ToString(d.Key),
-                            d.Value as ITaskItem))
-                        .Where(k => k.Value != null);
-                    foreach (var pair in items)
-                    {
-                        var group = _db.ItemGroups.FirstOrDefault(g => g.Name == pair.Key);
-                        if(group == null)
-                        {
-                            group = new ItemGroup()
-                            {
-                                Name = pair.Key
-                            };
-                            _db.ItemGroups.Add(group);
-                        }
+                    //Finish Items
+                    //var items = args.Items
+                    //    .Cast<DictionaryEntry>()
+                    //    .Select(d => new KeyValuePair<string, ITaskItem>(
+                    //        Convert.ToString(d.Key),
+                    //        d.Value as ITaskItem))
+                    //    .Where(k => k.Value != null);
+                    //foreach (var pair in items)
+                    //{
+                    //    var group = _db.ItemGroups.FirstOrDefault(g => g.Name == pair.Key);
+                    //    if(group == null)
+                    //    {
+                    //        group = new ItemGroup()
+                    //        {
+                    //            Name = pair.Key
+                    //        };
+                    //        _db.ItemGroups.Add(group);
+                    //    }
 
-                        Item could be parented to Projects or Tasks, and the metadata is associated with the instantiation.
-                    }
+                    //    //Item could be parented to Projects or Tasks, and the metadata is associated with the instantiation.
+                    //}
                 }
             }
         }
@@ -202,7 +239,7 @@ namespace Microsoft.Build.Logging.BuildDb
         private Property GetOrCreateProperty(string name, string value, bool isMetadata)
         {
             var def = _db.PropertyDefinitions.FirstOrDefault(d => d.Name == name && d.IsMetadata == isMetadata);
-            if(def == null)
+            if (def == null)
             {
                 def = new PropertyDefinition()
                 {
